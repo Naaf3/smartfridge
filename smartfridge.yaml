@@ -1,0 +1,952 @@
+## Originaly written by Alfred the SmartCamper
+## This configuration is for the M5Stack CoreS3 SE
+## https://docs.m5stack.com/en/core/M5CoreS3%20SE
+
+substitutions:
+  devicename: smartfridge
+  upper_devicename: SmartFridge
+
+esphome:
+  name: ${devicename}
+  friendly_name: ${upper_devicename}
+  on_boot:
+    - priority: 600
+      then:
+        - light.turn_on:
+            id: display_backlight
+            brightness: 80%
+    - priority: 100
+      then:
+        - delay: 200ms
+        - script.execute: wake_up_screen
+        - delay: 30s
+        - if:
+            condition:
+              lambda: return id(init_in_progress);
+            then:
+              - lambda: id(init_in_progress) = false;
+              - script.execute: wake_up_screen  
+
+esp32:
+  variant: esp32s3
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    ## Note: Disable these configurations if you face the boot loop issue.
+    sdkconfig_options:
+        CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+        CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+        CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+
+        # Moves instructions and read only data from flash into PSRAM on boot.
+        # Both enabled allows instructions to execute while a flash operation is in progress without needing to be placed in IRAM.
+        # Considerably speeds up mWW at the cost of using more PSRAM.
+        CONFIG_SPIRAM_RODATA: "y"
+        CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+
+        CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: "y"
+        CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY: "y"
+
+        CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+        CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"  # TLS1.3 support isn't enabled by default in IDF 5.1.5    
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  use_address: 192.168.1.15
+  manual_ip:
+    static_ip: 192.168.1.15
+    gateway: 192.168.1.1
+    subnet: 255.255.255.0
+    dns1: 192.168.1.1
+  fast_connect: true
+  ap:
+    ssid: $devicename Fallback Hotspot
+    password: !secret wifi_password
+
+captive_portal:
+
+logger:
+  level: DEBUG
+  logs:
+    mpu6886: ERROR
+    display: DEBUG
+    sensor: ERROR
+    binary_sensor: INFO
+    axp2101: DEBUG
+    axp2101.sensor: DEBUG
+    wifi: DEBUG
+    light: ERROR
+    preferences: DEBUG
+
+api:
+  on_client_connected:
+    - if:
+        condition:
+          lambda: 'return (0 == client_info.find("Home Assistant "));'
+        then:
+          - globals.set:
+              id: connected_to_hass
+              value: 'true'
+          - lvgl.widget.show: ${devicename}_hastatus
+          - lvgl.widget.hide: boot_screen
+          - script.execute: lvgl_restart_idle
+
+  on_client_disconnected:
+    - if:
+        condition:
+          lambda: 'return (0 == client_info.find("Home Assistant "));'
+        then:
+          - globals.set:
+              id: connected_to_hass
+              value: 'false'
+          - lvgl.widget.hide: ${devicename}_hastatus
+
+  actions:
+    - action: toggle_nightmode
+      variables: {}
+      then:
+        - script.execute: toggle_nightmode
+
+ota:
+  - platform: esphome
+    password: ota
+    
+psram:
+  mode: quad
+  speed: 80MHz
+
+external_components:
+  - source: github://m5stack/esphome-yaml/components
+    components: [axp2101, aw88298, aw9523b ]
+    refresh: 0s
+
+i2c:
+  - id: bus_internal
+    sda: GPIO12
+    scl: GPIO11
+
+spi:
+  - id: spi_bus
+    clk_pin: GPIO36
+    mosi_pin: GPIO37
+
+axp2101:
+  id: axp2101_pmu
+  i2c_id: bus_internal
+
+aw9523b:
+  id: aw9523b_hub
+  i2c_id: bus_internal
+  p0_drive_mode: PUSH_PULL
+
+output:
+  - platform: axp2101
+    type: range
+    channel: DLDO1
+    id: display_backlight_output
+    min_voltage: 2600
+    max_voltage: 3300
+
+  - platform: axp2101
+    channel: ALDO1
+    voltage: 1800
+
+  - platform: axp2101
+    channel: ALDO2
+    voltage: 3300
+
+  - platform: axp2101
+    channel: BLDO1
+    voltage: 2800
+
+  - platform: axp2101
+    channel: BLDO2
+    voltage: 1500
+
+  - platform: template
+    type: float
+    write_action: 
+      then:
+        - lambda: |-
+
+    id: display_output
+    
+time:
+  - platform: sntp
+    id: esptime
+
+globals:
+  - id: init_in_progress
+    type: bool
+    restore_value: no
+    initial_value: "true"
+  - id: current_brightness
+    type: float
+    restore_value: no
+    initial_value: '0.50'
+  - id: avoid_sleep
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: connected_to_hass
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+    ## Fridge globals %  
+  - id: target_temp
+    type: float
+    initial_value: "4.0"
+  - id: hysteresis
+    type: float
+    initial_value: "2.0"
+  - id: night_hysteresis
+    type: float
+    initial_value: "3.0"
+  - id: night_hours
+    type: int
+    initial_value: "9"
+  - id: night_seconds_left
+    type: int
+    initial_value: "0"
+  - id: night_active
+    type: bool
+    initial_value: "false"
+  - id: compressor_on
+    type: bool
+    initial_value: "false"
+
+image:
+  - platform: file
+    file: images/alfred.png
+    id: boot_screen_image
+    type: RGB565
+
+esp32_ble_tracker:
+
+sensor:
+  ## Fridge Sensor %
+  - platform: ruuvitag
+    mac_address: #put_the_mac_adress_here
+    id: fridge_ruuvi
+    temperature:
+      name: "Fridge Temperature"
+      id: fridge_temp
+
+  - platform: template
+    name: "Fridge Control Loop Trigger"
+    lambda: 'return id(fridge_temp).state;'
+    accuracy_decimals: 1
+    id: control_trigger
+    update_interval: 30s
+    on_value:
+      then:
+        - lambda: |-
+            float t = id(fridge_temp).state;
+            float target = id(target_temp);
+            float hyst = id(hysteresis);
+            if (id(night_active)) hyst += id(night_hysteresis);
+            float upper = target + hyst/2.0;
+            float lower = target - hyst/2.0;
+            if (t > upper && !id(compressor_on)) {
+              id(compressor_relay).turn_on();
+              id(compressor_on) = true;
+            } else if (t < lower && id(compressor_on)) {
+              id(compressor_relay).turn_off();
+              id(compressor_on) = false;
+            }
+        - lvgl.label.update:
+            id: temp_label_value
+            text:
+              format: "%.1f°C"
+              args: [id(fridge_temp).state]
+
+  ##Fridge Switches %
+
+switch:
+  - platform: template
+    name: "Fridge Nightmode"
+    id: nightmode_switch
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          id(night_active) = true;
+          id(night_seconds_left) = id(night_hours) * 3600;
+    turn_off_action:
+      - lambda: |-
+          id(night_active) = false;
+          id(night_seconds_left) = 0;
+
+  - platform: gpio
+    pin:
+      number: GPIO1
+    id: compressor_relay
+    name: "Fridge Compressor Relay"
+    restore_mode: ALWAYS_OFF
+    inverted: false
+    on_turn_on:
+      - logger.log:
+          level: INFO
+          format: "Compressor relay command: ON on GPIO1"
+    on_turn_off:
+      - logger.log:
+          level: INFO
+          format: "Compressor relay command: OFF on GPIO1"
+  
+font:
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 900
+    id: roboto_large
+    size: 20
+    bpp: 4
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 900
+    id: roboto
+    size: 16
+    bpp: 4
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 200
+    id: roboto_small
+    size: 14
+
+display:
+  - platform: mipi_spi
+    model: M5CORE
+    dc_pin: GPIO35
+    reset_pin:
+      aw9523b_id: aw9523b_hub
+      number: 9
+    cs_pin:
+      number: GPIO3
+      ignore_strapping_warning: true
+    data_rate: 40MHz
+    update_interval: never
+    invert_colors: true
+    id: main_display
+
+## LVGL UI
+
+lvgl:
+  touchscreens:
+    - touchscreen_id: touch
+  on_idle:
+    - timeout: 10sec
+      then:
+        - logger.log: "Dimming screen..."
+    - timeout: 20sec
+      then:
+        - logger.log: "Turning off screen..."
+        - if:
+            condition:
+              and:
+                - lambda: 'return id(connected_to_hass);'
+            then:
+              - light.turn_off: display_backlight
+
+  top_layer:
+    widgets:
+      - label:
+          text: "\uF1EB"
+          id: ${devicename}_hastatus
+          hidden: true
+          align: top_right
+          x: -8
+          y: 4
+          text_align: right
+          text_color: 0x808080
+      - obj:
+          id: boot_screen
+          x: 0
+          y: 0
+          width: 100%
+          height: 100%
+          bg_color: 0xffffff
+          bg_opa: COVER
+          radius: 0
+          pad_all: 0
+          border_width: 0
+          widgets:
+            - image:
+                align: CENTER
+                src: boot_screen_image
+            - spinner:
+                align: CENTER
+                y: 90
+                height: 40
+                width: 40
+                spin_time: 1s
+                arc_length: 60deg
+                arc_width: 8
+                indicator:
+                  arc_color: 0x18bcf2
+                  arc_width: 8
+          on_press:
+            - lvgl.widget.hide: boot_screen
+
+  pages:
+  ## Fridge Pages %
+    - id: fridge_main_page
+      width: 320
+      height: 240
+#      pad_top: 25
+      border_opa: TRANSP
+      scrollbar_mode: "OFF"
+      bg_color: white
+      on_swipe_left:
+        - lvgl.page.next:
+            animation: OUT_LEFT
+            time: 200ms
+      on_swipe_right:
+        - lvgl.page.previous:
+            animation: OUT_RIGHT
+            time: 200ms
+      widgets:
+        # Title Box
+        - obj:
+            id: fridge_title_box
+            x: 5
+            y: 15
+            width: 310
+            height: 45
+            bg_color: white
+            border_opa: LV_OPA_TRANSP
+            scrollbar_mode: "OFF"
+            scrollable: false
+            widgets:
+              - label:
+                  id: fridge_title_label
+                  align: CENTER
+                  text_align: CENTER
+                  text: "SmartFridge"
+                  text_font: roboto_large
+        # Temperature Display Box
+        - obj:
+            id: temp_display_box
+            x: 5
+            y: 60
+            width: 310
+            height: 45
+            bg_color: white
+            border_opa: LV_OPA_TRANSP
+            scrollbar_mode: "OFF"
+            scrollable: false
+            layout:
+              type: FLEX
+              flex_flow: ROW
+              flex_align_main: CENTER
+              flex_align_cross: CENTER
+            widgets:
+              - label:
+                  id: fridge_temp_label
+                  align: CENTER
+                  text_align: CENTER
+                  text: "Ist:"
+                  text_font: roboto_large
+              - label:
+                  id: temp_label_value
+                  align: CENTER
+                  text_align: CENTER
+                  text: "0°C"
+                  text_font: roboto_large
+
+        # Target Temp Control Box
+        - obj:
+            id: target_temp_control_box
+            width: 310
+            height: 80
+            x: 5
+            y: 100
+            bg_color: white
+            border_opa: LV_OPA_TRANSP
+            layout:
+              type: GRID
+              grid_columns: [FR(1), FR(1), FR(1)]
+              grid_rows: [FR(1)]
+              grid_row_align: SPACE_BETWEEN
+              grid_column_align: SPACE_BETWEEN
+            widgets:
+              - button:
+                  grid_cell_row_pos: 0
+                  grid_cell_column_pos: 0
+                  grid_cell_x_align: CENTER
+                  grid_cell_y_align: CENTER                  
+                  width: 40
+                  height: 40
+                  align: CENTER
+                  # text: "-"
+                  # text_font: roboto
+                  # text_align: CENTER                  
+                  on_click:
+                    - lambda: |-
+                        id(target_temp) -= 0.5;
+                    - script.execute: update_settings_page
+                  widgets:
+                    - label:
+                        text: "-"                   
+              - label:
+                  grid_cell_row_pos: 0
+                  grid_cell_column_pos: 1
+                  grid_cell_x_align: CENTER
+                  grid_cell_y_align: CENTER               
+                  id: target_temp_label
+                  text: "Soll: 4.0°C"
+                  text_font: roboto_large
+                  text_align: CENTER                   
+              - button:
+                  grid_cell_row_pos: 0
+                  grid_cell_column_pos: 2
+                  grid_cell_x_align: CENTER
+                  grid_cell_y_align: CENTER                  
+                  width: 40
+                  height: 40
+                  align: CENTER
+                  # text: "+"
+                  # text_font: roboto
+                  # text_align: CENTER                    
+                  on_click:
+                    - lambda: |-
+                        id(target_temp) += 0.5;
+                    - script.execute: update_settings_page
+                  widgets:
+                    - label:
+                        text: "+"                         
+
+        # Nachmodus Button and Info
+        - obj:
+            id: night_mode_info_box
+            width: 230
+            height: 60
+            x: 5
+            y: 180
+            bg_color: white
+            border_opa: TRANSP
+            widgets:
+              - label:
+                  id: night_info_label
+                  text: "Nachmodus: Aus"
+                  text_font: roboto_large
+                  text_align: CENTER     
+        - obj:
+            id: night_mode_button
+            width: 80
+            height: 60
+            x: 235
+            y: 180
+            bg_color: white            
+            border_opa: TRANSP
+            scrollbar_mode: "OFF"
+            scrollable: false
+            widgets:
+              - switch:
+                  id: nightmode_switch_widget
+                  align: CENTER
+                  on_click:
+                    - script.execute: toggle_nightmode                      
+
+    # SETTINGS PAGE
+    - id: fridge_settings_page
+      width: 320
+      height: 240
+#      pad_top: 25
+      border_opa: TRANSP
+      scrollbar_mode: "OFF"
+      bg_color: white
+      on_swipe_left:
+        - lvgl.page.next:
+            animation: OUT_LEFT
+            time: 200ms
+      on_swipe_right:
+        - lvgl.page.previous:
+            animation: OUT_RIGHT
+            time: 200ms
+      layout:
+        type: FLEX
+        flex_flow: COLUMN
+        flex_align_main: SPACE_BETWEEN
+      widgets:
+        - label:
+            x: 5
+            y: 5
+            text: "Settings"
+            text_font: roboto_large
+
+        # Hysteresis Setting
+        - obj:
+            x: 5
+            y: 15
+            width: 310
+            height: 50
+            bg_color: lightyellow
+            radius: 10
+            pad_all: 5
+            border_opa: TRANSP
+            layout:
+              type: FLEX
+              flex_flow: ROW
+              flex_align_main: SPACE_BETWEEN
+              flex_align_cross: CENTER
+            widgets:
+              - label:
+                  text: "Hysterese:"
+                  text_font: roboto
+              - button:
+                  width: 30
+                  height: 30
+                  text: "-"
+                  on_click:
+                    - lambda: |-
+                        id(hysteresis) = std::max(0.0f, id(hysteresis) - 0.5f);
+              - label:
+                  id: settings_hyst_label
+                  text: "2.0"
+                  text_font: roboto
+              - button:
+                  width: 30
+                  height: 30
+                  text: "+"
+                  on_click:
+                    - lambda: |-
+                        id(hysteresis) = std::min(10.0f, id(hysteresis) + 0.5f);
+
+        # Nachmodus Hours Setting
+        - obj:
+            x: 5
+            y: 75
+            width: 300
+            height: 50
+            bg_color: lightcyan
+            radius: 10
+            pad_all: 5
+            border_opa: TRANSP
+            layout:
+              type: FLEX
+              flex_flow: ROW
+              flex_align_main: SPACE_BETWEEN
+              flex_align_cross: CENTER
+            widgets:
+              - label:
+                  text: "Nacht Stunden:"
+                  text_font: roboto
+              - button:
+                  width: 30
+                  height: 30
+                  text: "-"
+                  on_click:
+                    - lambda: |-
+                        id(night_hours) = std::max(1, id(night_hours) - 1);
+              - label:
+                  id: settings_hours_label
+                  text: "9"
+                  text_font: roboto
+              - button:
+                  width: 30
+                  height: 30
+                  text: "+"
+                  on_click:
+                    - lambda: |-
+                        id(night_hours) = std::min(72, id(night_hours) + 1);
+
+number:
+  - platform: template
+    name: "Max Brightness"
+    id: max_brightness
+    optimistic: true
+    restore_value: true
+    min_value: 10
+    max_value: 100
+    step: 1.0
+    initial_value: 100
+    unit_of_measurement: "%"
+    mode: slider
+    entity_category: "config"
+    on_value:
+      then:
+        - delay: 100ms
+        - if:
+            condition:
+              light.is_on: display_backlight
+            then:
+              - light.control:
+                  id: display_backlight
+                  brightness: !lambda 'return x / 100.0;'
+
+  ## Fridge Numbers %
+  - platform: template
+    name: "Fridge Target Temperature"
+    id: target_number
+    min_value: -2.0
+    max_value: 12.0
+    step: 0.5
+    mode: box
+    set_action:
+      - lambda: |-
+          id(target_temp) = x;
+          id(update_settings_page).execute();
+    lambda: |-
+      return id(target_temp);
+
+  - platform: template
+    name: "Fridge Hysteresis (°C)"
+    id: hyst_number
+    min_value: 0.0
+    max_value: 10.0
+    step: 0.5
+    mode: box
+    set_action:
+      - lambda: |-
+          id(hysteresis) = x;
+          id(update_settings_page).execute();
+    lambda: |-
+      return id(hysteresis);
+
+  - platform: template
+    name: "Fridge Nightmode Hours"
+    id: night_hours_number
+    min_value: 1
+    max_value: 12
+    step: 1
+    optimistic: true
+    set_action:
+      - lambda: |-
+          id(night_hours) = (int)x;
+          id(update_settings_page).execute();
+          
+light:
+  - platform: monochromatic
+    name: "Display Backlight"
+    id: display_backlight
+    output: display_backlight_output
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 0ms
+    on_turn_off:
+      then:
+        - lambda: |-
+            id(main_display).set_update_interval(0);
+            id(main_display).set_brightness(0x00);
+    on_turn_on:
+      then:
+        - lambda: |-
+            float level = id(display_backlight).current_values.get_brightness();  // 0.0–1.0
+            id(main_display).set_brightness(0xFF);
+            id(main_display).set_update_interval(250);
+
+touchscreen:
+  - platform: ft63x6
+    id: touch
+    i2c_id: bus_internal
+    reset_pin:
+      aw9523b_id: aw9523b_hub
+      number: 0
+    calibration:
+      x_min: 0
+      x_max: 320
+      y_min: 0
+      y_max: 240
+    on_touch:
+      - script.execute: wake_up_screen
+
+binary_sensor:
+  - platform: gpio
+    name: "ES_INT P0_3"
+    pin:
+      aw9523b_id: aw9523b_hub
+      number: 3
+    on_press:
+      then:
+        - logger.log: "ES7210 interrupt triggered"
+    internal: true
+
+  - platform: gpio
+    name: "TF_SW P0_4"
+    pin:
+      aw9523b_id: aw9523b_hub
+      number: 4 
+    on_press:
+      then:
+        - logger.log: "TF_SW interrupt triggered"
+    internal: true
+  
+  - platform: gpio
+    name: "TOUCH_INT P1_2"
+    pin:
+      aw9523b_id: aw9523b_hub
+      number: 10
+    on_press:
+      then:
+        - logger.log: "TOUCH interrupt triggered"
+    internal: true
+
+  - platform: gpio
+    name: "AW_INT P1_3"
+    pin:
+      aw9523b_id: aw9523b_hub
+      number: 11
+    on_press:
+      then:
+        - logger.log: "AW88298 interrupt triggered"
+    internal: true
+  ## LEFT TOUCH - PREVIOUS PAGE
+  - platform: touchscreen
+    touchscreen_id: touch
+    name: Left Touch Button
+    x_min: 10
+    x_max: 120
+    y_min: 240
+    y_max: 280
+    use_raw: true
+    on_press:
+      then:
+        - lvgl.page.previous:
+            animation: MOVE_RIGHT
+            time: 200ms
+
+  ## MIDDLE TOUCH - BRIGHTNESS CONTROL
+  - platform: touchscreen
+    touchscreen_id: touch
+    name: Middle Touch Button
+    on_press:
+      then:
+        - lambda: |-
+            float max_b = id(max_brightness).state / 100.0;
+            float step = (max_b - 0.25f) / 3.0f;
+            float levels[] = {0.25f, 0.25f + step, 0.25f + 2 * step, max_b};
+            float current = id(current_brightness);
+            int idx = 0;
+            // Find the closest level >= current, then step to next
+            for (int i = 0; i < 4; i++) {
+              if (current <= levels[i] + 0.01) { idx = i; break; }
+            }
+            idx = (idx + 1) % 4;
+            id(current_brightness) = levels[idx];
+        - light.turn_on:
+            id: display_backlight
+            brightness: !lambda 'return id(current_brightness);'
+    x_min: 130
+    x_max: 200
+    y_min: 240
+    y_max: 280
+    use_raw: true
+
+  ## RIGHT TOUCH - NEXT PAGE
+  - platform: touchscreen
+    touchscreen_id: touch
+    name: Right Touch Button
+    id: right_button
+    x_min: 230
+    x_max: 310
+    y_min: 240
+    y_max: 280
+    use_raw: true
+    on_press:
+      then:
+        - lvgl.page.next:
+            animation: MOVE_LEFT
+            time: 200ms
+
+  ## Fridge Binary Sensors %
+  - platform: template
+    name: "Fridge Compressor Running"
+    id: compressor_running_binary
+    lambda: |-
+      return id(compressor_on);
+    device_class: running
+
+interval:
+  # frequent updates when screen on
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            light.is_on: display_backlight
+          then:
+
+  ## Fridge intervals %
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (id(night_seconds_left) > 0) {
+            id(night_seconds_left) -= 60;
+            if (id(night_seconds_left) <= 0) {
+              id(night_seconds_left) = 0;
+              id(night_active) = false;
+            }
+          }
+
+script:
+  ## WAKE UP SCREEN
+  - id: wake_up_screen
+    mode: restart
+    then:
+      - logger.log: "Running Wake Up Screen Script..."
+      # ENABLE WIFI
+      - if:
+          condition: 
+            not:
+              wifi.enabled
+          then:
+            - wifi.enable:
+      - script.execute: lvgl_restart_idle
+      ## LIGHTS ON
+ 
+      - light.turn_on:
+          id: display_backlight
+          brightness: !lambda 'return id(current_brightness);'
+
+  ## RESTART LVGL IDLE TIMER
+  - id: lvgl_restart_idle
+    mode: restart
+    then:
+      - if:
+          condition:
+            lvgl.is_paused:
+          then:
+            - lvgl.resume:
+            - lvgl.widget.redraw:
+      - lambda: 'lv_disp_trig_activity(NULL);' # reset LVGL idle timer
+
+  ## TOGGLE NIGHTMODE
+  - id: toggle_nightmode
+    mode: single
+    then:
+      - lambda: |-
+          id(night_active) = !id(night_active);
+          if (id(night_active)) id(night_seconds_left) = id(night_hours) * 3600;
+      - script.execute: update_settings_page
+
+  ## Fridge Settings Update %
+  - id: update_settings_page
+    mode: single
+    then:
+      - lvgl.label.update:
+          id: target_temp_label
+          text:
+            format: "Soll: %.1f°C"
+            args: [id(target_temp)]
+      - lvgl.label.update:
+          id: settings_hyst_label
+          text:
+            format: "%.1f"
+            args: [id(hysteresis)]
+      - lvgl.label.update:
+          id: settings_hours_label
+          text:
+            format: "%d"
+            args: [id(night_hours)]
+      - lvgl.label.update:
+          id: night_info_label
+          text: !lambda |-
+            if (id(night_active)) {
+              int hours = id(night_seconds_left) / 3600;
+              static char buf[64];
+              snprintf(buf, sizeof(buf), "Nightmode: AN (%d h)", hours);
+              return buf;
+            }
+            return "Nightmode: Aus";
