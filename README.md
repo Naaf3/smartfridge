@@ -64,6 +64,7 @@ The following parameters can be controlled right now:
 - duration of night time mode
 
 Parameters/features to be build in the future:
+- GUI has room for improvement 😏
 - better night time mode; the actual is just an increase of the hysteresis; the plan is to set up a time, i.e. 10pm, at which night time mode starts; the fridge should have a defined temperature, i.e. 2 degrees below target temperature, so the fridge stays cool longer
 - on/off switch
 - security feature like, what happens if the Ruuvi bluetooth sensor signal is lost
